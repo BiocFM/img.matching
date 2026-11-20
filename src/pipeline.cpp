@@ -1,22 +1,21 @@
 // Registration pipeline: detection (SIFT or SuperPoint) -> FLANN + Lowe's
-// ratio test -> RANSAC homography (outlier filter) -> affine on the inliers.
+// ratio test, or RoMa (dense matching, matches directly) -> RANSAC homography
+// (outlier filter) -> affine on the inliers.
 
-#include "superpoint.h"   // OpenCV + shared structs 
+#include "superpoint.h"
+#include "roma.h"
 #include <Rcpp.h>
-
-
 
 #include <chrono>
 #include <cmath>
 #include <string>
 #include <vector>
 
-
-// ============================================================================
+// ---------------------------------------------------------------------------
 // R <-> OpenCV conversion
-// ============================================================================
+// ---------------------------------------------------------------------------
 
-// R numeric matrix (column-major) -> single-channel CV_32F cv::Mat (row-major).
+// R matrix -> single-channel CV_32F cv::Mat, values unchanged (scaling happens per detector)
 static cv::Mat rmatToMat(const Rcpp::NumericMatrix& m, const char* name)
 {
     const int rows = m.nrow(), cols = m.ncol();
@@ -71,10 +70,9 @@ static Rcpp::DataFrame keypointsToDf(const std::vector<cv::KeyPoint>& kp)
                                    Rcpp::Named("size") = size);
 }
 
-
-// ============================================================================
-// Reading parameters from the R list (with defaults)
-// ============================================================================
+// ---------------------------------------------------------------------------
+// Parameters from the R list (with defaults)
+// ---------------------------------------------------------------------------
 
 static std::string getString(const Rcpp::List& p, const char* name, const std::string& def)
 {
@@ -86,10 +84,9 @@ static double getNumber(const Rcpp::List& p, const char* name, double def)
     return p.containsElementNamed(name) ? Rcpp::as<double>(p[name]) : def;
 }
 
-
-// ============================================================================
+// ---------------------------------------------------------------------------
 // SIFT
-// ============================================================================
+// ---------------------------------------------------------------------------
 
 static void computeSIFT(const cv::Mat& image8u, const SIFTParameters& params,
                         std::vector<cv::KeyPoint>& keypoints, cv::Mat& descriptors)
@@ -98,10 +95,9 @@ static void computeSIFT(const cv::Mat& image8u, const SIFTParameters& params,
     sift->detectAndCompute(image8u, cv::noArray(), keypoints, descriptors);
 }
 
-
-// ============================================================================
+// ---------------------------------------------------------------------------
 // Shared matching + RANSAC
-// ============================================================================
+// ---------------------------------------------------------------------------
 
 static void getFLANNMatches(const cv::Mat& descriptors1, const cv::Mat& descriptors2,
                             std::vector<std::vector<cv::DMatch>>& matches)
@@ -123,8 +119,7 @@ static std::vector<cv::DMatch> filterMatchesRatio(
     return good;
 }
 
-// RANSAC homography as outlier filter. Returns H (3x3, image1 -> image2) or an
-// empty Mat; inlier_flags[i] tells whether matches[i] is an inlier.
+// RANSAC homography (image1 -> image2) as outlier filter, empty Mat if it fails
 static cv::Mat estimateHomographyRANSAC(const std::vector<cv::KeyPoint>& kp1,
                                         const std::vector<cv::KeyPoint>& kp2,
                                         const std::vector<cv::DMatch>& matches,
@@ -167,10 +162,9 @@ static cv::Mat estimateAffineOnInliers(const std::vector<cv::KeyPoint>& kp1,
     return cv::estimateAffine2D(pts1, pts2);   
 }
 
-
-// ============================================================================
+// ---------------------------------------------------------------------------
 // Function called from R
-// ============================================================================
+// ---------------------------------------------------------------------------
 
 // [[Rcpp::export]]
 Rcpp::List registerimages_cpp(Rcpp::NumericMatrix image1,
@@ -196,10 +190,15 @@ Rcpp::List registerimages_cpp(Rcpp::NumericMatrix image1,
     sp_params.detection_threshold = static_cast<float>(getNumber(parameters, "detection_threshold", sp_params.detection_threshold));
     sp_params.max_pixels          = static_cast<int>(getNumber(parameters, "max_pixels", sp_params.max_pixels));
 
+    RomaParameters roma_params;
+    roma_params.num_matches         = static_cast<int>(getNumber(parameters, "num_matches", roma_params.num_matches));
+    roma_params.certainty_threshold = static_cast<float>(getNumber(parameters, "certainty_threshold", roma_params.certainty_threshold));
+    roma_params.seed                = static_cast<uint32_t>(getNumber(parameters, "seed", roma_params.seed));
+
     SIFTParameters ransac_params;
     ransac_params.ransac_pixel_threshold = static_cast<int>(getNumber(parameters, "ransac_threshold", ransac_params.ransac_pixel_threshold));
     ransac_params.ransac_confidence      = static_cast<float>(getNumber(parameters, "ransac_confidence", ransac_params.ransac_confidence));
-    ransac_params.ransac_maxIters       = static_cast<int>(getNumber(parameters, "ransac_max_iters", ransac_params.ransac_maxIters));
+    ransac_params.ransac_maxIters        = static_cast<int>(getNumber(parameters, "ransac_max_iters", ransac_params.ransac_maxIters));
 
     // --- images -----------------------------------------------------------
     const cv::Mat img1 = rmatToMat(image1, "image1");
@@ -208,6 +207,7 @@ Rcpp::List registerimages_cpp(Rcpp::NumericMatrix image1,
     // --- detection (declared here so they exist after the if/else) ----------
     std::vector<cv::KeyPoint> kp1, kp2;
     cv::Mat desc1, desc2;
+    std::vector<cv::DMatch> good;   // matches for RANSAC
 
     if (detection == "SIFT") {
         computeSIFT(toUint8(img1), sift_params, kp1, desc1);
@@ -219,28 +219,37 @@ Rcpp::List registerimages_cpp(Rcpp::NumericMatrix image1,
         const std::string model_path = Rcpp::as<std::string>(parameters["model_path"]);
         detectSuperPoint(img1, model_path, sp_params, kp1, desc1);
         detectSuperPoint(img2, model_path, sp_params, kp2, desc2);
+    } else if (detection == "RoMa") {
+        if (!parameters.containsElementNamed("model_path")) {
+            Rcpp::stop("parameters$model_path (path to the traced RoMa .pt) is required for RoMa.");
+        }
+        const std::string model_path = Rcpp::as<std::string>(parameters["model_path"]);
+        detectRoma(img1, img2, model_path, roma_params, kp1, kp2, good);
     } else {
-        Rcpp::stop("detection = '" + detection + "' is not supported ('SIFT' or 'SuperPoint').");
+        Rcpp::stop("detection = '" + detection + "' is not supported ('SIFT', 'SuperPoint' or 'RoMa').");
     }
 
-    if (desc1.rows < 2 || desc2.rows < 2) {
-        Rcpp::stop("Too few keypoints found (image1: " + std::to_string(desc1.rows) +
-                   ", image2: " + std::to_string(desc2.rows) + "); need at least 2 each.");
+    // --- matching (RoMa already returns matches) ----------------------------
+    if (detection != "RoMa") {
+        if (desc1.rows < 2 || desc2.rows < 2) {
+            Rcpp::stop("Too few keypoints found (image1: " + std::to_string(desc1.rows) +
+                       ", image2: " + std::to_string(desc2.rows) + "); need at least 2 each.");
+        }
+        if (desc1.type() != CV_32F) desc1.convertTo(desc1, CV_32F);   // FLANN needs float
+        if (desc2.type() != CV_32F) desc2.convertTo(desc2, CV_32F);
+
+        std::vector<std::vector<cv::DMatch>> knn;
+        getFLANNMatches(desc1, desc2, knn);
+        good = filterMatchesRatio(knn, lowe_ratio);
     }
-    if (desc1.type() != CV_32F) desc1.convertTo(desc1, CV_32F);   // FLANN KD-tree needs float
-    if (desc2.type() != CV_32F) desc2.convertTo(desc2, CV_32F);
 
-    // --- matching + RANSAC --------------------------------------------------
-    std::vector<std::vector<cv::DMatch>> knn;
-    getFLANNMatches(desc1, desc2, knn);
-    const std::vector<cv::DMatch> good = filterMatchesRatio(knn, lowe_ratio);
-
+    // --- RANSAC + affine ----------------------------------------------------
     std::vector<bool> inlier_flags;
     const cv::Mat H = estimateHomographyRANSAC(kp1, kp2, good, ransac_params, inlier_flags);
     const cv::Mat A = H.empty() ? cv::Mat()
                                 : estimateAffineOnInliers(kp1, kp2, good, inlier_flags);
 
-    // --- results for R ------------------------------------------------------
+    // --- results for R -----------------------------------------------------
     const R_xlen_t n_good = static_cast<R_xlen_t>(good.size());
     Rcpp::IntegerVector idx1(n_good), idx2(n_good);
     Rcpp::NumericVector distance(n_good);
@@ -249,7 +258,7 @@ Rcpp::List registerimages_cpp(Rcpp::NumericMatrix image1,
     for (R_xlen_t i = 0; i < n_good; ++i) {
         idx1[i]     = good[i].queryIdx + 1;   // 1-based rows of keypoints1
         idx2[i]     = good[i].trainIdx + 1;   // 1-based rows of keypoints2
-        distance[i] = good[i].distance;
+        distance[i] = good[i].distance;       // RoMa: 1 - certainty
         inlier[i]   = inlier_flags[i];
         if (inlier_flags[i]) ++n_inliers;
     }
