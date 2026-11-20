@@ -16,7 +16,8 @@ Imports:
     methods,
     EBImage,
     Rcpp,
-    torch
+    torch,
+    hfhub
 Suggests:
     magick,
     png,
