@@ -15,8 +15,8 @@ struct SuperPointParameters
 struct SIFTParameters
 { 
   int sift_nfeatures=20000;
-  int ransac_pixel_threshold = 5;
-  float ransac_confidence = 0.95;
+  double ransac_pixel_threshold = 5.0;
+  float ransac_confidence = 0.95f;
   int ransac_maxIters=2000;
 };
 
